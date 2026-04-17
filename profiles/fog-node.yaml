@@ -1,0 +1,23 @@
+name: fog-node
+kind: install-profile
+version: 0.1.0
+
+description: >-
+  Placeholder install profile for a fog-capable SourceOS node. This profile is
+  intended to compose the SourceOS substrate, the fog first-boot ignition lane,
+  and the canonical fog contract family.
+
+sourceos:
+  substrateRepo: SociOS-Linux/SourceOS
+  ignitionRepo: SociOS-Linux/socios-ignition
+  ignitionProfile: profiles/fog/fog-node.bu
+  contractRepo: SourceOS-Linux/sourceos-spec
+
+safety:
+  requireExplicitDiskSelection: true
+  requireProfileReview: true
+  defaultEnrollment: off
+
+notes:
+  - Replace ignitionProfile with a pinned artifact reference before promotion.
+  - Installer wiring should surface target-disk confirmation and provenance.
