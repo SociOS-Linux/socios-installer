@@ -15,6 +15,8 @@ Minor changes:
 Internal changes:
 
 
+- docs: Add fog installer entrypoint note and `profiles/fog-node.yaml` install-profile placeholder
+
 Packaging changes:
 
 ## Upcoming coreos-installer 0.26.0 (2026-02-27)
