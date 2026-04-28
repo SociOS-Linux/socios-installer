@@ -14,6 +14,7 @@
 
 use anyhow::{bail, Context, Result};
 use nix::mount;
+#[cfg(not(target_arch = "s390x"))]
 use regex::{Captures, Regex};
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -33,6 +34,7 @@ use crate::source::*;
 
 // Match the grub.cfg console settings commands in
 // https://github.com/coreos/coreos-assembler/blob/main/src/grub.cfg
+#[cfg(not(target_arch = "s390x"))]
 const GRUB_CFG_CONSOLE_SETTINGS_RE: &str = r"(?P<prefix>\n# CONSOLE-SETTINGS-START\n)(?P<commands>([^\n]*\n)*)(?P<suffix># CONSOLE-SETTINGS-END\n)";
 
 pub fn install(config: InstallConfig) -> Result<()> {
@@ -414,33 +416,25 @@ fn write_disk(
             write_ignition(mount.mountpoint(), &config.ignition_hash, ignition)
                 .context("writing Ignition configuration")?;
         }
-        if let Some(platform) = config.platform.as_ref() {
-            write_platform(mount.mountpoint(), platform).context("writing platform ID")?;
-        }
-        if config.platform.is_some() || !config.console.is_empty() {
-            write_console(
-                mount.mountpoint(),
-                config.platform.as_deref(),
-                &config.console,
-            )
-            .context("configuring console")?;
-        }
-        if let Some(firstboot_args) = config.firstboot_args.as_ref() {
-            write_firstboot_kargs(mount.mountpoint(), firstboot_args)
-                .context("writing firstboot kargs")?;
-        }
-        if !config.append_karg.is_empty() || !config.delete_karg.is_empty() {
-            eprintln!("Modifying kernel arguments");
 
-            Console::maybe_warn_on_kargs(&config.append_karg, "--append-karg", "--console");
-            visit_bls_entry_options(mount.mountpoint(), |orig_options: &str| {
-                KargsEditor::new()
-                    .append(config.append_karg.as_slice())
-                    .delete(config.delete_karg.as_slice())
-                    .maybe_apply_to(orig_options)
-            })
-            .context("deleting and appending kargs")?;
-        }
+        configure_kernel_arguments(
+            mount.mountpoint(),
+            config.firstboot_args.as_deref(),
+            config.platform.as_deref(),
+            &config.console,
+            &config.append_karg,
+            &config.delete_karg,
+        )
+        .context("configuring kernel arguments")?;
+
+        #[cfg(not(target_arch = "s390x"))]
+        configure_grub(
+            mount.mountpoint(),
+            config.platform.as_deref(),
+            &config.console,
+        )
+        .context("configuring GRUB")?;
+
         if let Some(network_config) = network_config.as_ref() {
             copy_network_config(mount.mountpoint(), network_config)?;
         }
@@ -462,6 +456,67 @@ fn write_disk(
 
     // detect any latent write errors
     dest.sync_all().context("syncing data to disk")?;
+
+    Ok(())
+}
+
+/// Configure kernel arguments.
+///
+/// This function handles:
+/// - Platform ID configuration
+/// - Console kernel arguments
+/// - Firstboot kernel arguments
+/// - Explicit kernel argument modifications (--append-karg, --delete-karg)
+fn configure_kernel_arguments(
+    mountpoint: &Path,
+    firstboot_args: Option<&str>,
+    platform: Option<&str>,
+    console: &[Console],
+    append_kargs: &[String],
+    delete_kargs: &[String],
+) -> Result<()> {
+    if let Some(platform) = platform {
+        // custom console settings completely override platform-specific defaults
+        configure_platform_kargs(mountpoint, platform, !console.is_empty())
+            .context("configuring platform")?;
+    }
+
+    if !console.is_empty() {
+        configure_console_kargs(mountpoint, console).context("configuring console kargs")?;
+    }
+
+    if let Some(firstboot_args) = firstboot_args {
+        write_firstboot_kargs(mountpoint, firstboot_args).context("writing firstboot kargs")?;
+    }
+
+    if !append_kargs.is_empty() || !delete_kargs.is_empty() {
+        eprintln!("Modifying kernel arguments");
+        Console::maybe_warn_on_kargs(append_kargs, "--append-karg", "--console");
+
+        visit_bls_entry_options(mountpoint, |orig_options: &str| {
+            KargsEditor::new()
+                .append(append_kargs)
+                .delete(delete_kargs)
+                .maybe_apply_to(orig_options)
+        })
+        .context("modifying kernel arguments")?;
+    }
+
+    Ok(())
+}
+
+/// Configure GRUB console settings.
+#[cfg(not(target_arch = "s390x"))]
+fn configure_grub(mountpoint: &Path, platform: Option<&str>, console: &[Console]) -> Result<()> {
+    // custom console settings completely override platform-specific defaults
+    if !console.is_empty() {
+        let grub_commands = build_grub_console_commands(console);
+        update_grub_console_settings(mountpoint, &grub_commands)
+            .context("configuring GRUB console")?;
+    } else if let Some(platform) = platform {
+        configure_platform_grub_console(mountpoint, platform)
+            .context("configuring platform GRUB console")?;
+    }
 
     Ok(())
 }
@@ -551,18 +606,34 @@ fn write_firstboot_kargs(mountpoint: &Path, args: &str) -> Result<()> {
 #[derive(Clone, Default, Deserialize)]
 struct PlatformSpec {
     #[serde(default)]
+    #[cfg(not(target_arch = "s390x"))]
     grub_commands: Vec<String>,
     #[serde(default)]
     kernel_arguments: Vec<String>,
 }
 
-/// Override the platform ID.
-fn write_platform(mountpoint: &Path, platform: &str) -> Result<()> {
-    // early return if setting the platform to the default value, since
-    // otherwise we'll think we failed to set it
+/// Read the platform specifications from the platforms.json file.
+fn read_platform_specs(mountpoint: &Path) -> Result<HashMap<String, PlatformSpec>> {
+    match fs::read_to_string(mountpoint.join("coreos/platforms.json")) {
+        Ok(json) => serde_json::from_str::<HashMap<String, PlatformSpec>>(&json)
+            .context("parsing platform table"),
+        // no table for this image?
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Default::default()),
+        Err(e) => Err(e).context("reading platform table"),
+    }
+}
+
+/// Configure platform-specific kernel arguments
+fn configure_platform_kargs(
+    mountpoint: &Path,
+    platform: &str,
+    skip_console_kargs: bool,
+) -> Result<()> {
+    // Early return if setting the platform to the default value
     if platform == "metal" {
         return Ok(());
     }
+
     eprintln!("Setting platform to {platform}");
 
     // We assume that we will only install from metal images and that the
@@ -577,83 +648,119 @@ fn write_platform(mountpoint: &Path, platform: &str) -> Result<()> {
         }
         Ok(Some(new_options))
     })?;
+
+    // Apply platform-specific console kernel arguments unless overridden by user
+    if !skip_console_kargs {
+        configure_platform_console_kargs(mountpoint, platform)?;
+    }
+
     Ok(())
 }
 
-/// Configure console kernel arguments and GRUB commands.
-fn write_console(mountpoint: &Path, platform: Option<&str>, consoles: &[Console]) -> Result<()> {
-    // read platforms table
-    let platforms = match fs::read_to_string(mountpoint.join("coreos/platforms.json")) {
-        Ok(json) => serde_json::from_str::<HashMap<String, PlatformSpec>>(&json)
-            .context("parsing platform table")?,
-        // no table for this image?
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Default::default(),
-        Err(e) => return Err(e).context("reading platform table"),
-    };
+/// Configure platform-specific console kernel arguments.
+fn configure_platform_console_kargs(mountpoint: &Path, platform: &str) -> Result<()> {
+    let platforms = read_platform_specs(mountpoint)?;
+    let spec = platforms.get(platform).cloned().unwrap_or_default();
+    let metal_spec = platforms.get("metal").cloned().unwrap_or_default();
 
-    let mut kargs = Vec::new();
-    let mut grub_commands = Vec::new();
-    if !consoles.is_empty() {
-        // custom console settings completely override platform-specific
-        // defaults
-        let mut grub_terminals = Vec::new();
-        for console in consoles {
-            kargs.push(console.karg());
-            if let Some(cmd) = console.grub_command() {
-                grub_commands.push(cmd);
-            }
-            grub_terminals.push(console.grub_terminal());
-        }
-        grub_terminals.sort_unstable();
-        grub_terminals.dedup();
-        for direction in ["input", "output"] {
-            grub_commands.push(format!("terminal_{direction} {}", grub_terminals.join(" ")));
-        }
-    } else if let Some(platform) = platform {
-        // platform-specific defaults
-        if platform == "metal" {
-            // we're just being asked to apply the defaults which are already
-            // applied
-            return Ok(());
-        }
-        let spec = platforms.get(platform).cloned().unwrap_or_default();
-        kargs.extend(spec.kernel_arguments);
-        grub_commands.extend(spec.grub_commands);
-    } else {
-        // nothing to do and the caller shouldn't have called us
-        unreachable!();
+    if !spec.kernel_arguments.is_empty() || !metal_spec.kernel_arguments.is_empty() {
+        visit_bls_entry_options(mountpoint, |orig_options: &str| {
+            KargsEditor::new()
+                .append(&spec.kernel_arguments)
+                .delete(&metal_spec.kernel_arguments)
+                .maybe_apply_to(orig_options)
+                .context("setting platform kernel arguments")
+        })?;
     }
 
-    // set kargs, removing any metal-specific ones
+    Ok(())
+}
+
+/// Configure platform-specific GRUB console settings.
+#[cfg(not(target_arch = "s390x"))]
+fn configure_platform_grub_console(mountpoint: &Path, platform: &str) -> Result<()> {
+    let platforms = read_platform_specs(mountpoint)?;
+    let spec = platforms.get(platform).cloned().unwrap_or_default();
     let metal_spec = platforms.get("metal").cloned().unwrap_or_default();
+
+    if spec.grub_commands != metal_spec.grub_commands {
+        update_grub_console_settings(mountpoint, &spec.grub_commands)?;
+    }
+
+    Ok(())
+}
+
+/// Configure console kernel arguments.
+fn configure_console_kargs(mountpoint: &Path, consoles: &[Console]) -> Result<()> {
+    eprintln!("Configuring console settings");
+
+    let platforms = read_platform_specs(mountpoint)?;
+    let metal_spec = platforms.get("metal").cloned().unwrap_or_default();
+
+    // Build console kernel arguments
+    let mut kargs = Vec::new();
+    for console in consoles {
+        kargs.push(console.karg());
+    }
+
+    // Apply console kernel arguments, removing metal-specific ones
     visit_bls_entry_options(mountpoint, |orig_options: &str| {
         KargsEditor::new()
             .append(&kargs)
             .delete(&metal_spec.kernel_arguments)
             .maybe_apply_to(orig_options)
-            .context("setting platform kernel arguments")
+            .context("setting console kernel arguments")
     })?;
 
-    // set grub commands
-    if grub_commands != metal_spec.grub_commands {
-        // prefer the new grub2/console.cfg, but fallback to grub2/grub.cfg
-        let mut name = "grub2/console.cfg";
-        let mut path = mountpoint.join(name);
-        if !path.exists() {
-            name = "grub2/grub.cfg";
-            path = mountpoint.join(name);
+    Ok(())
+}
+
+/// Build GRUB console commands from console specifications.
+#[cfg(not(target_arch = "s390x"))]
+fn build_grub_console_commands(consoles: &[Console]) -> Vec<String> {
+    let mut grub_commands = Vec::new();
+    let mut grub_terminals = Vec::new();
+
+    for console in consoles {
+        if let Some(cmd) = console.grub_command() {
+            grub_commands.push(cmd);
         }
-        let grub_cfg = fs::read_to_string(&path).with_context(|| format!("reading {name}"))?;
-        let new_grub_cfg = update_grub_cfg_console_settings(&grub_cfg, &grub_commands)
-            .with_context(|| format!("updating {name}"))?;
-        fs::write(&path, new_grub_cfg).with_context(|| format!("writing {name}"))?;
+        grub_terminals.push(console.grub_terminal());
     }
+
+    grub_terminals.sort_unstable();
+    grub_terminals.dedup();
+
+    for direction in ["input", "output"] {
+        grub_commands.push(format!("terminal_{direction} {}", grub_terminals.join(" ")));
+    }
+
+    grub_commands
+}
+
+/// Update GRUB console settings in grub.cfg or console.cfg.
+#[cfg(not(target_arch = "s390x"))]
+fn update_grub_console_settings(mountpoint: &Path, commands: &[String]) -> Result<()> {
+    // Prefer the new grub2/console.cfg, but fallback to grub2/grub.cfg
+    let mut name = "grub2/console.cfg";
+    let mut path = mountpoint.join(name);
+    if !path.exists() {
+        name = "grub2/grub.cfg";
+        path = mountpoint.join(name);
+    }
+
+    let grub_cfg = fs::read_to_string(&path).with_context(|| format!("reading {name}"))?;
+    let new_grub_cfg = apply_grub_console_commands(&grub_cfg, commands)
+        .with_context(|| format!("updating {name}"))?;
+    fs::write(&path, new_grub_cfg).with_context(|| format!("writing {name}"))?;
+
     Ok(())
 }
 
 /// Rewrite the grub.cfg CONSOLE-SETTINGS block to use the specified GRUB
 /// commands, and return the result.
-fn update_grub_cfg_console_settings(grub_cfg: &str, commands: &[String]) -> Result<String> {
+#[cfg(not(target_arch = "s390x"))]
+fn apply_grub_console_commands(grub_cfg: &str, commands: &[String]) -> Result<String> {
     let mut new_commands = commands.join("\n");
     if !new_commands.is_empty() {
         new_commands.push('\n');
@@ -822,6 +929,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_arch = "s390x"))]
     fn test_update_grub_cfg() {
         let base_cfgs = vec![
             // no existing commands
@@ -834,22 +942,22 @@ mod tests {
         for cfg in base_cfgs {
             // no new commands
             assert_eq!(
-                update_grub_cfg_console_settings(cfg, &[]).unwrap(),
+                apply_grub_console_commands(cfg, &[]).unwrap(),
                 "a\nb\n# CONSOLE-SETTINGS-START\n# CONSOLE-SETTINGS-END\nc\nd"
             );
             // one new command
             assert_eq!(
-                update_grub_cfg_console_settings(cfg, &["first".into()]).unwrap(),
+                apply_grub_console_commands(cfg, &["first".into()]).unwrap(),
                 "a\nb\n# CONSOLE-SETTINGS-START\nfirst\n# CONSOLE-SETTINGS-END\nc\nd"
             );
             // multiple new commands
             assert_eq!(
-                update_grub_cfg_console_settings(cfg, &["first".into(), "sec ond".into(), "third".into()]).unwrap(),
+                apply_grub_console_commands(cfg, &["first".into(), "sec ond".into(), "third".into()]).unwrap(),
                 "a\nb\n# CONSOLE-SETTINGS-START\nfirst\nsec ond\nthird\n# CONSOLE-SETTINGS-END\nc\nd"
             );
         }
 
         // missing substitution marker
-        update_grub_cfg_console_settings("a\nb\nc\nd", &[]).unwrap_err();
+        apply_grub_console_commands("a\nb\nc\nd", &[]).unwrap_err();
     }
 }

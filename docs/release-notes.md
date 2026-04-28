@@ -14,6 +14,8 @@ Minor changes:
 
 Internal changes:
 
+- install: Fix '--console' flag handling on s390x
+- install: Disable GRUB configuration on s390x
 
 - docs: Add fog installer entrypoint note and `profiles/fog-node.yaml` install-profile placeholder
 
